@@ -1,0 +1,12 @@
+# Compiled binary
+server
+*.o
+*.out
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp

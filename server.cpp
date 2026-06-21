@@ -13,8 +13,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
-
-// test
+#include <atomic>
+#include <csignal>
+#include <ctime>
 #include <chrono>
 
 using std::condition_variable;
@@ -30,14 +31,14 @@ using std::thread;
 using std::unordered_map;
 using std::vector;
 
-// test
-using std::chrono::seconds;
-using std::this_thread::sleep_for;
+std::atomic<bool> running{true};
+int listen_fd = -1; // global so the signal handler can close it
 
 constexpr int WORKER_COUNT = 8;
 queue<int> client_queue;
 mutex queue_mutex;
 condition_variable queue_cv;
+constexpr size_t MAX_BODY_SIZE = 1024 * 1024; // 1 MB
 
 using RouteHandler = function<void(
     int,                                  // client fd
@@ -48,6 +49,20 @@ using RouteHandler = function<void(
     )>;
 
 unordered_map<string, RouteHandler> routes;
+
+// send the entire buffer, looping until all bytes are written
+bool send_all(int client, const string &data)
+{
+    size_t total = 0;
+    while (total < data.size())
+    {
+        ssize_t n = send(client, data.c_str() + total, data.size() - total, 0);
+        if (n <= 0)
+            return false; // client gone or error
+        total += static_cast<size_t>(n);
+    }
+    return true;
+}
 
 // generic error handlers
 void send_error(int client, int code, const string &message)
@@ -66,7 +81,7 @@ void send_error(int client, int code, const string &message)
         "\r\n" +
         body;
 
-    send(client, response.c_str(), response.size(), 0);
+    send_all(client, response);
 }
 
 // generic response handler
@@ -87,9 +102,7 @@ void send_response(int client, const string &body, const string &status = "200 O
         "\r\n\r\n" +
         body;
 
-    ssize_t nSend = send(client, response.c_str(), response.size(), 0);
-
-    if (nSend < 0)
+    if (!send_all(client, response))
     {
         printf("Failed to send to Client %d \n", client);
     }
@@ -97,6 +110,48 @@ void send_response(int client, const string &body, const string &status = "200 O
     {
         printf("Response sent to Client %d \n", client);
     }
+}
+
+// escape a string for safe embedding in JSON
+string json_escape(const string &s)
+{
+    string out;
+    out.reserve(s.size());
+
+    for (unsigned char c : s)
+    {
+        switch (c)
+        {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (c < 0x20)
+            {
+                char buf[7];
+                snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            }
+            else
+            {
+                out += c;
+            }
+        }
+    }
+
+    return out;
 }
 
 // generic json handler
@@ -269,6 +324,13 @@ void handle_client(int client_connection)
         iss >> path;
         iss >> version;
 
+        // strip path from any query
+        size_t qpos = path.find('?');
+        if (qpos != string::npos)
+        {
+            path = path.substr(0, qpos);
+        }
+
         // check if valid request
         if (method.empty() || path.empty() || version.empty())
         {
@@ -292,7 +354,21 @@ void handle_client(int client_connection)
         size_t body_len = 0;
         if (headers.find("Content-Length") != headers.end())
         {
-            body_len = stoi(headers["Content-Length"]);
+            try
+            {
+                body_len = stoi(headers["Content-Length"]);
+
+                if (body_len > MAX_BODY_SIZE)
+                {
+                    send_error(client_connection, 413, "Oversized Payload");
+                    break;
+                }
+            }
+            catch (...)
+            {
+                send_error(client_connection, 400, "Bad Request");
+                break;
+            }
         }
 
         while (body.size() < body_len)
@@ -343,6 +419,7 @@ void handle_client(int client_connection)
         catch (...)
         {
             send_error(client_connection, 500, "Internal Server Error");
+            break;
         }
     }
 
@@ -358,7 +435,10 @@ void worker_thread()
         {
             std::unique_lock<mutex> lock(queue_mutex);
             queue_cv.wait(lock, []
-                          { return !client_queue.empty(); });
+                          { return !client_queue.empty() || !running; });
+
+            if (!running && client_queue.empty())
+                return; // drain done, exit thread
 
             client_connection = client_queue.front();
             client_queue.pop();
@@ -368,7 +448,14 @@ void worker_thread()
     }
 }
 
-int main()
+void handle_sigint(int)
+{
+    running = false;
+    if (listen_fd != -1)
+        close(listen_fd); // unblocks accept()
+}
+
+int main(int argc, char *argv[])
 {
     // routes
     routes["/api/health"] = [](int client, const string &method, const string &, const string &, const auto &)
@@ -402,7 +489,7 @@ int main()
             return;
         }
 
-        send_json(client, string("{\"echo\":") + "\"" + body + "\"}");
+        send_json(client, string("{\"echo\":\"") + json_escape(body) + "\"}");
     };
 
     // create socket
@@ -415,10 +502,14 @@ int main()
     }
 
     // bind to address / port
+    int port = 8080; 
+    if(argc > 1)
+        port = atoi(argv[1]); 
+
     sockaddr_in address{}; // need to zero
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(8080);
+    address.sin_port = htons(port);
 
     int bindStatus = bind(httpServer, (sockaddr *)&address, sizeof(address));
 
@@ -444,13 +535,19 @@ int main()
         workers.emplace_back(worker_thread);
     }
 
-    while (true)
+    listen_fd = httpServer;
+    signal(SIGINT, handle_sigint);
+    signal(SIGPIPE, SIG_IGN); // don't die if a client disconnects mid-send
+
+    while (running)
     {
         // accept
         int clientConnection = accept(httpServer, nullptr, nullptr);
 
         if (clientConnection < 0)
         {
+            if (!running)
+                break; // socket closed by shutdown
             printf("Accept failure");
             continue;
         }
@@ -462,4 +559,13 @@ int main()
 
         queue_cv.notify_one();
     }
+
+    // shutdown: wake all workers so they can drain the queue and exit
+    queue_cv.notify_all();
+
+    for (auto &w : workers)
+        w.join();
+
+    printf("Server shut down cleanly\n");
+    return 0;
 }
